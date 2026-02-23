@@ -71,7 +71,9 @@ typedef enum {
     PIN_HEATER_SET,
     PIN_MAX6675_CLK_SET,
     PIN_MAX6675_CS_SET,
-    PIN_MAX6675_DO_SET
+    PIN_MAX6675_DO_SET,
+    HOTEND_MODE_MENU,
+    OPEN_LOOP_POWER_SET
 } menu_state_t;
 
 static menu_state_t current_state = SPLASH;
@@ -91,9 +93,27 @@ static int32_t last_encoder_value = 0;
 static bool is_running = false;  // Track if process is running
 static uint32_t run_start_time = 0;  // Track run time
 
+// Hotend mode: 0=Closed Loop (PID), 1=Open Loop (fixed power)
+static int hotend_mode = 0;
+static int open_loop_power = 50;  // Open loop heater power (0-100%)
+static int hotend_mode_menu_index = 0;
+static menu_state_t confirm_return_state = START_RUNNING;  // Where to return on cancel
+
+// Long press detection
+static bool last_raw_btn_state = false;
+static uint32_t btn_debounce_time_ms = 0;
+static bool debounced_btn_state = false;
+static uint32_t btn_press_start_time = 0;
+static bool long_press_fired = false;
+#define LONG_PRESS_DURATION_MS 1000
+
 // Stepper motor control
 static uint32_t last_step_time = 0;
 static bool heater_enabled = false;
+
+// Heater time-proportional control state
+static uint32_t heater_window_start = 0;
+#define HEATER_WINDOW_MS 1000  // 1-second window for time-proportional control
 
 // Animation frame counter
 static uint8_t anim_frame = 0;
@@ -160,10 +180,9 @@ static int map_value(int x, int in_min, int in_max, int out_min, int out_max) {
     return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }
 
-// PID Controller calculation
-static void update_pid(void) {
-    uint32_t now = esp_timer_get_time() / 1000;
-    float dt = (now - last_pid_time) / 1000.0f;  // Convert to seconds
+// PID Controller calculation (derivative-on-measurement to avoid setpoint kick)
+static void update_pid(uint32_t now_ms) {
+    float dt = (now_ms - last_pid_time) / 1000.0f;  // Convert to seconds
     
     if (dt < 0.01f) return;  // Don't update too frequently
     
@@ -184,9 +203,9 @@ static void update_pid(void) {
     if (pid_integral < -100.0f) pid_integral = -100.0f;
     float i_term = Ki * pid_integral;
     
-    // Derivative term
-    float derivative = (error - pid_last_error) / dt;
-    float d_term = Kd * derivative;
+    // Derivative term (on measurement, not error, to avoid setpoint kick)
+    float d_measurement = -(current_temp - pid_last_error) / dt;
+    float d_term = Kd * d_measurement;
     
     // Calculate output
     pid_output = p_term + i_term + d_term;
@@ -195,27 +214,37 @@ static void update_pid(void) {
     if (pid_output > 100.0f) pid_output = 100.0f;
     if (pid_output < 0.0f) pid_output = 0.0f;
     
-    // Store for next iteration
-    pid_last_error = error;
-    last_pid_time = now;
+    // Store current measurement for next derivative calculation
+    pid_last_error = current_temp;
+    last_pid_time = now_ms;
+}
+
+// Helper: write an NVS int32 only if the value differs from what's stored (reduces flash wear)
+static void nvs_set_i32_if_changed(nvs_handle_t handle, const char *key, int32_t value) {
+    int32_t stored;
+    if (nvs_get_i32(handle, key, &stored) != ESP_OK || stored != value) {
+        nvs_set_i32(handle, key, value);
+    }
 }
 
 // Save settings to NVS flash
 static void save_settings_to_nvs(void) {
-    nvs_set_i32(nvs_handle_settings, "temperature", temperature);
-    nvs_set_i32(nvs_handle_settings, "motor_speed", motor_speed);
-    nvs_set_i32(nvs_handle_settings, "microstep", microstep);
-    nvs_set_i32(nvs_handle_settings, "kp_x10", kp_x10);
-    nvs_set_i32(nvs_handle_settings, "ki_x10", ki_x10);
-    nvs_set_i32(nvs_handle_settings, "kd_x10", kd_x10);
+    nvs_set_i32_if_changed(nvs_handle_settings, "temperature", temperature);
+    nvs_set_i32_if_changed(nvs_handle_settings, "motor_speed", motor_speed);
+    nvs_set_i32_if_changed(nvs_handle_settings, "microstep", microstep);
+    nvs_set_i32_if_changed(nvs_handle_settings, "kp_x10", kp_x10);
+    nvs_set_i32_if_changed(nvs_handle_settings, "ki_x10", ki_x10);
+    nvs_set_i32_if_changed(nvs_handle_settings, "kd_x10", kd_x10);
+    nvs_set_i32_if_changed(nvs_handle_settings, "hotend_mode", hotend_mode);
+    nvs_set_i32_if_changed(nvs_handle_settings, "ol_power", open_loop_power);
     // Save pin configurations
-    nvs_set_i32(nvs_handle_settings, "pin_step", pin_stepper_step);
-    nvs_set_i32(nvs_handle_settings, "pin_dir", pin_stepper_dir);
-    nvs_set_i32(nvs_handle_settings, "pin_enable", pin_stepper_enable);
-    nvs_set_i32(nvs_handle_settings, "pin_heater", pin_heater);
-    nvs_set_i32(nvs_handle_settings, "pin_clk", pin_max6675_clk);
-    nvs_set_i32(nvs_handle_settings, "pin_cs", pin_max6675_cs);
-    nvs_set_i32(nvs_handle_settings, "pin_do", pin_max6675_do);
+    nvs_set_i32_if_changed(nvs_handle_settings, "pin_step", pin_stepper_step);
+    nvs_set_i32_if_changed(nvs_handle_settings, "pin_dir", pin_stepper_dir);
+    nvs_set_i32_if_changed(nvs_handle_settings, "pin_enable", pin_stepper_enable);
+    nvs_set_i32_if_changed(nvs_handle_settings, "pin_heater", pin_heater);
+    nvs_set_i32_if_changed(nvs_handle_settings, "pin_clk", pin_max6675_clk);
+    nvs_set_i32_if_changed(nvs_handle_settings, "pin_cs", pin_max6675_cs);
+    nvs_set_i32_if_changed(nvs_handle_settings, "pin_do", pin_max6675_do);
     nvs_commit(nvs_handle_settings);
     ESP_LOGI(TAG, "Settings saved to flash");
 }
@@ -240,6 +269,12 @@ static void load_settings_from_nvs(void) {
     }
     if (nvs_get_i32(nvs_handle_settings, "kd_x10", &val) == ESP_OK) {
         kd_x10 = val;
+    }
+    if (nvs_get_i32(nvs_handle_settings, "hotend_mode", &val) == ESP_OK) {
+        hotend_mode = val;
+    }
+    if (nvs_get_i32(nvs_handle_settings, "ol_power", &val) == ESP_OK) {
+        open_loop_power = val;
     }
     // Load pin configurations
     if (nvs_get_i32(nvs_handle_settings, "pin_step", &val) == ESP_OK) {
@@ -369,10 +404,12 @@ static void init_hardware_control(void) {
 // Start the process - enable heater and motor
 static void start_process(void) {
     is_running = true;
-    run_start_time = esp_timer_get_time() / 1000;
+    uint32_t now_ms = esp_timer_get_time() / 1000;
+    run_start_time = now_ms;
     pid_integral = 0.0f;  // Reset PID integral
-    pid_last_error = 0.0f;
-    last_pid_time = esp_timer_get_time() / 1000;
+    pid_last_error = current_temp;  // Initialize to current measurement (derivative-on-measurement)
+    last_pid_time = now_ms;
+    heater_window_start = now_ms;
     
     // Enable stepper motor (LOW = enabled for TB6600)
     gpio_set_level(pin_stepper_enable, 0);
@@ -398,12 +435,18 @@ static void stop_process(void) {
     ESP_LOGI(TAG, "Process stopped - Heater and motor disabled");
 }
 
-// Update heater PWM based on PID output
-static void update_heater_output(void) {
+// Update heater using time-proportional control (software PWM at 1Hz)
+// This gives proportional power output without requiring hardware PWM
+static void update_heater_output(uint32_t now_ms) {
     if (heater_enabled && is_running) {
-        // Simple on/off control based on PID output percentage
-        // For better control, use LEDC PWM
-        if (pid_output > 50.0f) {
+        uint32_t elapsed = now_ms - heater_window_start;
+        if (elapsed >= HEATER_WINDOW_MS) {
+            heater_window_start = now_ms;
+            elapsed = 0;
+        }
+        // pid_output is 0-100%, convert to on-time within window
+        uint32_t on_time_ms = (uint32_t)(pid_output * HEATER_WINDOW_MS / 100.0f);
+        if (elapsed < on_time_ms) {
             gpio_set_level(pin_heater, 1);
         } else {
             gpio_set_level(pin_heater, 0);
@@ -414,6 +457,9 @@ static void update_heater_output(void) {
 }
 
 // Generate step pulses for stepper motor
+// NOTE: Called from ~5ms polling loop, so step timing has ~5ms jitter.
+// At motor_speed=100% (500us interval), steps will bunch up. For smoother
+// high-speed motion, consider using a hardware timer or RMT peripheral.
 static void update_stepper_motor(void) {
     if (!is_running || motor_speed == 0) {
         return;
@@ -479,12 +525,27 @@ static void draw_main_menu(void) {
     sh1106_fill_rect(&display, 0, 0, 128, 12, SH1106_COLOR_WHITE);
     sh1106_set_text_size(&display, 1);
     sh1106_set_text_color(&display, SH1106_COLOR_BLACK, SH1106_COLOR_WHITE);
-    sh1106_set_cursor(&display, 20, 2);
-    sh1106_print(&display, "FILAMENT RECYCLER");
+    if (is_running) {
+        sh1106_set_cursor(&display, 4, 2);
+        sh1106_print(&display, "RECYCLER");
+        sh1106_set_cursor(&display, 70, 2);
+        sh1106_print(&display, "[RUNNING]");
+    } else {
+        sh1106_set_cursor(&display, 20, 2);
+        sh1106_print(&display, "FILAMENT RECYCLER");
+    }
 
-    // Menu items (6 items, show 3 at a time with scrolling)
-    const char *items[] = {"Start Process", "Temperature", "Motor Speed", "Microstep", "PID Settings", "Pin Settings"};
-    const uint8_t *icons[] = {icon_play, icon_temp, icon_motor, icon_gear, icon_gear, icon_gear};
+    // Menu items (7 items, show 3 at a time with scrolling)
+    const char *items[] = {
+        is_running ? "View Process" : "Start Process",
+        "Temperature", "Motor Speed", "Microstep",
+        "Hotend Mode", "PID Settings", "Pin Settings"
+    };
+    const uint8_t *icons[] = {
+        is_running ? icon_fan : icon_play,
+        icon_temp, icon_motor, icon_gear,
+        icon_temp, icon_gear, icon_gear
+    };
     
     // Calculate scroll offset to keep selected item visible
     int scroll_offset = 0;
@@ -494,9 +555,24 @@ static void draw_main_menu(void) {
     
     for (int i = 0; i < 3; i++) {
         int item_idx = i + scroll_offset;
-        if (item_idx >= 6) break;
+        if (item_idx >= 7) break;
         
         int y = 16 + (i * 16);
+        
+        // Draw item value string
+        char val[12];
+        val[0] = '\0';
+        int val_x = 100;
+        if (item_idx == 1) {
+            snprintf(val, sizeof(val), "%dC", temperature);
+        } else if (item_idx == 2) {
+            snprintf(val, sizeof(val), "%d%%", motor_speed);
+        } else if (item_idx == 3) {
+            snprintf(val, sizeof(val), "1/%d", microstep);
+            val_x = 96;
+        } else if (item_idx == 4) {
+            snprintf(val, sizeof(val), "%s", hotend_mode == 0 ? "CL" : "OL");
+        }
         
         if (item_idx == main_menu_index) {
             // Selected item - inverted
@@ -506,19 +582,8 @@ static void draw_main_menu(void) {
             sh1106_set_cursor(&display, 16, y + 3);
             sh1106_print(&display, items[item_idx]);
             
-            // Show current value
-            char val[12];
-            if (item_idx == 1) {
-                snprintf(val, sizeof(val), "%dC", temperature);
-                sh1106_set_cursor(&display, 100, y + 3);
-                sh1106_print(&display, val);
-            } else if (item_idx == 2) {
-                snprintf(val, sizeof(val), "%d%%", motor_speed);
-                sh1106_set_cursor(&display, 100, y + 3);
-                sh1106_print(&display, val);
-            } else if (item_idx == 3) {
-                snprintf(val, sizeof(val), "1/%d", microstep);
-                sh1106_set_cursor(&display, 96, y + 3);
+            if (val[0]) {
+                sh1106_set_cursor(&display, val_x, y + 3);
                 sh1106_print(&display, val);
             }
             
@@ -530,19 +595,8 @@ static void draw_main_menu(void) {
             sh1106_set_cursor(&display, 16, y + 3);
             sh1106_print(&display, items[item_idx]);
             
-            // Show current value
-            char val[12];
-            if (item_idx == 1) {
-                snprintf(val, sizeof(val), "%dC", temperature);
-                sh1106_set_cursor(&display, 100, y + 3);
-                sh1106_print(&display, val);
-            } else if (item_idx == 2) {
-                snprintf(val, sizeof(val), "%d%%", motor_speed);
-                sh1106_set_cursor(&display, 100, y + 3);
-                sh1106_print(&display, val);
-            } else if (item_idx == 3) {
-                snprintf(val, sizeof(val), "1/%d", microstep);
-                sh1106_set_cursor(&display, 96, y + 3);
+            if (val[0]) {
+                sh1106_set_cursor(&display, val_x, y + 3);
                 sh1106_print(&display, val);
             }
         }
@@ -554,10 +608,57 @@ static void draw_main_menu(void) {
         sh1106_set_text_color(&display, SH1106_COLOR_WHITE, SH1106_COLOR_BLACK);
         sh1106_print(&display, "^");
     }
-    if (scroll_offset + 3 < 6) {
+    if (scroll_offset + 3 < 7) {
         sh1106_set_cursor(&display, 60, 62);
         sh1106_set_text_color(&display, SH1106_COLOR_WHITE, SH1106_COLOR_BLACK);
-        sh1106_print(&display, "v");
+        // When running, replace scroll-down indicator with stop hint
+        if (is_running) {
+            sh1106_print(&display, "Hold:Stop");
+        } else {
+            sh1106_print(&display, "v");
+        }
+    } else if (is_running) {
+        // No scroll indicator needed, but still show the stop hint
+        sh1106_set_text_color(&display, SH1106_COLOR_WHITE, SH1106_COLOR_BLACK);
+        sh1106_set_cursor(&display, 30, 62);
+        sh1106_print(&display, "Hold to stop");
+    }
+}
+
+static void draw_hotend_mode_menu(void) {
+    // Header
+    sh1106_fill_rect(&display, 0, 0, 128, 12, SH1106_COLOR_WHITE);
+    sh1106_set_text_size(&display, 1);
+    sh1106_set_text_color(&display, SH1106_COLOR_BLACK, SH1106_COLOR_WHITE);
+    sh1106_set_cursor(&display, 22, 2);
+    sh1106_print(&display, "HOTEND MODE");
+
+    // Menu items
+    const char *items[] = {"Mode", "Heater Power", "< Back"};
+    
+    for (int i = 0; i < 3; i++) {
+        int y = 16 + (i * 14);
+        
+        if (i == hotend_mode_menu_index) {
+            sh1106_fill_rect(&display, 0, y, 128, 13, SH1106_COLOR_WHITE);
+            sh1106_set_text_color(&display, SH1106_COLOR_BLACK, SH1106_COLOR_WHITE);
+        } else {
+            sh1106_set_text_color(&display, SH1106_COLOR_WHITE, SH1106_COLOR_BLACK);
+        }
+        
+        sh1106_set_cursor(&display, 4, y + 3);
+        sh1106_print(&display, items[i]);
+        
+        // Show values
+        if (i == 0) {
+            sh1106_set_cursor(&display, 70, y + 3);
+            sh1106_print(&display, hotend_mode == 0 ? "Closed Loop" : "Open Loop");
+        } else if (i == 1) {
+            char val[8];
+            snprintf(val, sizeof(val), "%d%%", open_loop_power);
+            sh1106_set_cursor(&display, 100, y + 3);
+            sh1106_print(&display, val);
+        }
     }
 }
 
@@ -567,7 +668,7 @@ static void draw_start_running(void) {
     sh1106_set_text_size(&display, 1);
     sh1106_set_text_color(&display, SH1106_COLOR_BLACK, SH1106_COLOR_WHITE);
     sh1106_set_cursor(&display, 30, 2);
-    sh1106_print(&display, "RUNNING");
+    sh1106_print(&display, hotend_mode == 0 ? "RUN:CL" : "RUN:OL");
     
     // Animated spinner
     const char spinner[] = {'|', '/', '-', '\\'};
@@ -592,10 +693,14 @@ static void draw_start_running(void) {
     snprintf(set_temp_str, sizeof(set_temp_str), "%dC", temperature);
     sh1106_print(&display, set_temp_str);
     
-    // PID output (heater power)
+    // Heater power display
     sh1106_set_cursor(&display, 100, 16);
     char pid_str[8];
-    snprintf(pid_str, sizeof(pid_str), "%d%%", (int)pid_output);
+    if (hotend_mode == 0) {
+        snprintf(pid_str, sizeof(pid_str), "%d%%", (int)pid_output);
+    } else {
+        snprintf(pid_str, sizeof(pid_str), "%d%%", open_loop_power);
+    }
     sh1106_print(&display, pid_str);
     
     // Motor speed
@@ -902,7 +1007,9 @@ static void handle_menu_click(void) {
         case MAIN_MENU:
             if (main_menu_index == 0) {
                 current_state = START_RUNNING;
-                start_process();  // Enable heater and motor
+                if (!is_running) {
+                    start_process();  // Enable heater and motor only if not already running
+                }
                 configure_encoder_for_menu(0, 1, 0, false);
             } else if (main_menu_index == 1) {
                 current_state = TEMP_SET;
@@ -927,9 +1034,13 @@ static void handle_menu_click(void) {
                 else if (microstep == 32) microstep_idx = 5;
                 configure_encoder_for_menu(0, 5, microstep_idx, false);
             } else if (main_menu_index == 4) {
+                current_state = HOTEND_MODE_MENU;
+                hotend_mode_menu_index = 0;
+                configure_encoder_for_menu(0, 2, 0, false);  // 3 items
+            } else if (main_menu_index == 5) {
                 current_state = PID_MENU;
                 configure_encoder_for_menu(0, 3, 0, false);
-            } else if (main_menu_index == 5) {
+            } else if (main_menu_index == 6) {
                 current_state = PIN_MENU;
                 configure_encoder_for_menu(0, 7, 0, false);  // 8 items (0-7)
             }
@@ -937,11 +1048,12 @@ static void handle_menu_click(void) {
 
         case START_RUNNING:
             if (start_menu_index == 0) {
-                // Back - stop the process
-                stop_process();  // Disable heater and motor
+                // Back - keep running in background, return to main menu
                 current_state = MAIN_MENU;
-                configure_encoder_for_menu(0, 5, 0, false);
+                configure_encoder_for_menu(0, 6, 0, false);
             } else {
+                // Stop - confirm first
+                confirm_return_state = START_RUNNING;
                 current_state = START_CONFIRM_STOP;
                 configure_encoder_for_menu(0, 1, 1, false);  // Default to NO
             }
@@ -951,29 +1063,58 @@ static void handle_menu_click(void) {
             if (confirm_stop_index == 0) {  // YES
                 stop_process();  // Disable heater and motor
                 current_state = MAIN_MENU;
-                configure_encoder_for_menu(0, 5, 0, false);
+                configure_encoder_for_menu(0, 6, 0, false);
             } else {  // NO
-                current_state = START_RUNNING;
-                configure_encoder_for_menu(0, 1, 0, false);
+                if (confirm_return_state == MAIN_MENU) {
+                    current_state = MAIN_MENU;
+                    configure_encoder_for_menu(0, 6, 0, false);
+                } else {
+                    current_state = START_RUNNING;
+                    configure_encoder_for_menu(0, 1, 0, false);
+                }
             }
             break;
 
         case TEMP_SET:
             save_settings_to_nvs();
             current_state = MAIN_MENU;
-            configure_encoder_for_menu(0, 5, 1, false);
+            configure_encoder_for_menu(0, 6, 1, false);
             break;
 
         case MOTOR_SPEED_SET:
             save_settings_to_nvs();
             current_state = MAIN_MENU;
-            configure_encoder_for_menu(0, 5, 2, false);
+            configure_encoder_for_menu(0, 6, 2, false);
             break;
 
         case MICROSTEP_SET:
             save_settings_to_nvs();
             current_state = MAIN_MENU;
-            configure_encoder_for_menu(0, 5, 3, false);
+            configure_encoder_for_menu(0, 6, 3, false);
+            break;
+
+        case HOTEND_MODE_MENU:
+            if (hotend_mode_menu_index == 0) {
+                // Toggle mode
+                hotend_mode = hotend_mode == 0 ? 1 : 0;
+                save_settings_to_nvs();
+                needs_update = true;
+            } else if (hotend_mode_menu_index == 1) {
+                // Heater power slider
+                current_state = OPEN_LOOP_POWER_SET;
+                configure_encoder_for_menu(0, 100, open_loop_power, true);
+            } else {
+                // Back
+                current_state = MAIN_MENU;
+                configure_encoder_for_menu(0, 6, 4, false);
+            }
+            break;
+
+        case OPEN_LOOP_POWER_SET:
+            save_settings_to_nvs();
+            current_state = HOTEND_MODE_MENU;
+            hotend_mode_menu_index = 1;
+            configure_encoder_for_menu(0, 2, 1, false);
             break;
 
         case PID_MENU:
@@ -989,7 +1130,7 @@ static void handle_menu_click(void) {
             } else {
                 // Back
                 current_state = MAIN_MENU;
-                configure_encoder_for_menu(0, 5, 4, false);
+                configure_encoder_for_menu(0, 6, 5, false);
             }
             break;
 
@@ -1036,7 +1177,7 @@ static void handle_menu_click(void) {
             } else {
                 // Back
                 current_state = MAIN_MENU;
-                configure_encoder_for_menu(0, 5, 5, false);
+                configure_encoder_for_menu(0, 6, 6, false);
             }
             break;
 
@@ -1148,10 +1289,16 @@ void app_main(void) {
             last_max6675_read = current_time;
         }
 
-        // Update PID controller when running
+        // Update heater and motor control when running
         if (is_running) {
-            update_pid();
-            update_heater_output();
+            if (hotend_mode == 0) {
+                // Closed loop - PID temperature control
+                update_pid(current_time);
+            } else {
+                // Open loop - fixed power output
+                pid_output = (float)open_loop_power;
+            }
+            update_heater_output(current_time);
             update_stepper_motor();
         }
 
@@ -1179,7 +1326,7 @@ void app_main(void) {
 
             if (current_time - splash_start_time > 2000) {
                 current_state = MAIN_MENU;
-                configure_encoder_for_menu(0, 5, 0, false);
+                configure_encoder_for_menu(0, 6, 0, false);
                 needs_update = true;
             }
             vTaskDelay(pdMS_TO_TICKS(20));
@@ -1256,6 +1403,12 @@ void app_main(void) {
                 case PID_MENU:
                     pid_menu_index = new_encoder_value;
                     break;
+                case HOTEND_MODE_MENU:
+                    hotend_mode_menu_index = new_encoder_value;
+                    break;
+                case OPEN_LOOP_POWER_SET:
+                    open_loop_power = new_encoder_value;
+                    break;
                 case KP_SET:
                     kp_x10 = new_encoder_value;
                     break;
@@ -1294,10 +1447,44 @@ void app_main(void) {
             }
         }
 
-        // Check button click
-        if (AiEsp32RotaryEncoder_isEncoderButtonClicked(&rotaryEncoder)) {
-            handle_menu_click();
-            needs_update = true;
+        // Long press detection and button click handling
+        bool raw_btn = AiEsp32RotaryEncoder_isEncoderButtonDown(&rotaryEncoder);
+        if (raw_btn != last_raw_btn_state) {
+            btn_debounce_time_ms = current_time;
+        }
+        last_raw_btn_state = raw_btn;
+
+        if ((current_time - btn_debounce_time_ms) > 30) {  // 30ms debounce
+            if (raw_btn != debounced_btn_state) {
+                debounced_btn_state = raw_btn;
+                if (debounced_btn_state) {
+                    // Button just pressed
+                    btn_press_start_time = current_time;
+                    long_press_fired = false;
+                } else {
+                    // Button released
+                    if (!long_press_fired) {
+                        // Normal short click
+                        handle_menu_click();
+                        needs_update = true;
+                    }
+                    long_press_fired = false;
+                }
+            }
+        }
+
+        // Check for long press while button is held
+        if (debounced_btn_state && !long_press_fired) {
+            if ((current_time - btn_press_start_time) > LONG_PRESS_DURATION_MS) {
+                long_press_fired = true;
+                // Long press in main menu while running: prompt to stop
+                if (current_state == MAIN_MENU && is_running) {
+                    confirm_return_state = MAIN_MENU;
+                    current_state = START_CONFIRM_STOP;
+                    configure_encoder_for_menu(0, 1, 1, false);  // Default to NO
+                    needs_update = true;
+                }
+            }
         }
 
         // Update display if needed
@@ -1342,6 +1529,12 @@ void app_main(void) {
                 }
                 case PID_MENU:
                     draw_pid_menu();
+                    break;
+                case HOTEND_MODE_MENU:
+                    draw_hotend_mode_menu();
+                    break;
+                case OPEN_LOOP_POWER_SET:
+                    draw_slider("HEATER POWER", open_loop_power, 0, 100, "%", icon_temp);
                     break;
                 case KP_SET:
                     draw_float_slider("SET Kp", kp_x10, 0, 100, "Kp");
