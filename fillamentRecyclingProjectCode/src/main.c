@@ -107,9 +107,13 @@ static uint32_t btn_press_start_time = 0;
 static bool long_press_fired = false;
 #define LONG_PRESS_DURATION_MS 1000
 
-// Stepper motor control
-static uint32_t last_step_time = 0;
+// Stepper motor control via hardware timer (precise pulse generation)
+static esp_timer_handle_t stepper_timer_handle = NULL;
+static uint32_t current_stepper_interval_us = 0;
 static bool heater_enabled = false;
+
+static void stepper_timer_start(void);
+static void stepper_timer_stop(void);
 
 // Heater time-proportional control state
 static uint32_t heater_window_start = 0;
@@ -306,24 +310,30 @@ static void load_settings_from_nvs(void) {
 static float read_max6675_temperature(void) {
     uint16_t data = 0;
     
-    // Pull CS low to start communication
+    // Ensure CLK is LOW before starting (MAX6675 requires SCK LOW when not in use)
+    gpio_set_level(pin_max6675_clk, 0);
+    
+    // Pull CS low to start communication - D15 appears on SO immediately
     gpio_set_level(pin_max6675_cs, 0);
     esp_rom_delay_us(10);
     
-    // Read 16 bits
+    // Read 16 bits MSB first
+    // Data is available on SO after CS goes LOW (for D15) and after each falling edge
     for (int i = 15; i >= 0; i--) {
-        gpio_set_level(pin_max6675_clk, 0);
-        esp_rom_delay_us(10);
-        
+        // Read current bit (data is already valid on SO)
         if (gpio_get_level(pin_max6675_do)) {
             data |= (1 << i);
         }
         
+        // Clock pulse: HIGH then LOW shifts next bit onto SO
         gpio_set_level(pin_max6675_clk, 1);
+        esp_rom_delay_us(10);
+        gpio_set_level(pin_max6675_clk, 0);
         esp_rom_delay_us(10);
     }
     
-    // Pull CS high to end communication
+    // Pull CS high to end communication and start new conversion
+    // CLK remains LOW (required during conversion)
     gpio_set_level(pin_max6675_cs, 1);
     
     // Check for thermocouple open circuit (bit 2)
@@ -363,7 +373,7 @@ static void init_max6675(void) {
     
     // Set initial states
     gpio_set_level(pin_max6675_cs, 1);  // CS high (inactive)
-    gpio_set_level(pin_max6675_clk, 1); // CLK high
+    gpio_set_level(pin_max6675_clk, 0); // CLK low (must be LOW when idle per MAX6675 datasheet)
     
     ESP_LOGI(TAG, "MAX6675 initialized: CLK=%d, CS=%d, DO=%d", 
              pin_max6675_clk, pin_max6675_cs, pin_max6675_do);
@@ -416,6 +426,7 @@ static void start_process(void) {
     gpio_set_level(pin_stepper_dir, 1);  // Set direction
     
     heater_enabled = true;
+    stepper_timer_start();  // Start hardware timer for precise step pulses
     ESP_LOGI(TAG, "Process started - Heater and motor enabled");
 }
 
@@ -423,6 +434,7 @@ static void start_process(void) {
 static void stop_process(void) {
     is_running = false;
     heater_enabled = false;
+    stepper_timer_stop();  // Stop hardware timer first
     
     // Disable stepper motor (HIGH = disabled for TB6600)
     gpio_set_level(pin_stepper_enable, 1);
@@ -456,32 +468,47 @@ static void update_heater_output(uint32_t now_ms) {
     }
 }
 
-// Generate step pulses for stepper motor
-// NOTE: Called from ~5ms polling loop, so step timing has ~5ms jitter.
-// At motor_speed=100% (500us interval), steps will bunch up. For smoother
-// high-speed motion, consider using a hardware timer or RMT peripheral.
-static void update_stepper_motor(void) {
-    if (!is_running || motor_speed == 0) {
+// Stepper motor timer callback - runs from high-priority esp_timer task
+// Provides precise, jitter-free step pulses independent of main loop timing
+static void stepper_timer_callback(void *arg) {
+    gpio_set_level(pin_stepper_step, 1);
+    esp_rom_delay_us(5);  // 5us pulse width (TB6600 needs min 2.5us)
+    gpio_set_level(pin_stepper_step, 0);
+}
+
+// Calculate step interval from motor_speed percentage
+static uint32_t calculate_step_interval(void) {
+    if (motor_speed == 0) return 0;
+    uint32_t base_interval_us = 500;   // Fastest interval at 100% speed
+    uint32_t max_interval_us = 50000;  // Slowest interval at 1% speed
+    return base_interval_us +
+        ((100 - motor_speed) * (max_interval_us - base_interval_us)) / 100;
+}
+
+// Start or update the stepper timer with the current motor_speed
+static void stepper_timer_start(void) {
+    uint32_t interval = calculate_step_interval();
+    if (interval == 0) {
+        if (current_stepper_interval_us != 0) {
+            esp_timer_stop(stepper_timer_handle);
+            current_stepper_interval_us = 0;
+        }
         return;
     }
-    
-    // Calculate step interval based on speed and microstep
-    // Higher microstep = smoother but needs more pulses
-    // Speed 100% = fastest, Speed 1% = slowest
-    uint32_t base_interval_us = 500;  // Base step interval at 100% speed
-    uint32_t max_interval_us = 50000; // Slowest step interval at 1% speed
-    
-    // Calculate interval: slower speed = longer interval
-    uint32_t step_interval_us = base_interval_us + 
-        ((100 - motor_speed) * (max_interval_us - base_interval_us)) / 100;
-    
-    uint32_t now_us = esp_timer_get_time();
-    if ((now_us - last_step_time) >= step_interval_us) {
-        // Generate step pulse
-        gpio_set_level(pin_stepper_step, 1);
-        esp_rom_delay_us(5);  // 5us pulse width (TB6600 needs min 2.5us)
-        gpio_set_level(pin_stepper_step, 0);
-        last_step_time = now_us;
+    if (interval != current_stepper_interval_us) {
+        if (current_stepper_interval_us != 0) {
+            esp_timer_stop(stepper_timer_handle);
+        }
+        esp_timer_start_periodic(stepper_timer_handle, interval);
+        current_stepper_interval_us = interval;
+    }
+}
+
+// Stop the stepper timer
+static void stepper_timer_stop(void) {
+    if (current_stepper_interval_us != 0) {
+        esp_timer_stop(stepper_timer_handle);
+        current_stepper_interval_us = 0;
     }
 }
 
@@ -812,7 +839,7 @@ static void draw_slider(const char *title, int val, int min_v, int max_v, const 
     sh1106_print(&display, unit);
     
     // Min/max labels
-    char min_str[8], max_str[8];
+    char min_str[16], max_str[16];
     snprintf(min_str, sizeof(min_str), "%d", min_v);
     snprintf(max_str, sizeof(max_str), "%d", max_v);
     sh1106_set_cursor(&display, 4, 42);
@@ -859,7 +886,7 @@ static void draw_float_slider(const char *title, int val_x10, int min_x10, int m
     sh1106_set_text_size(&display, 1);
     
     // Min/max labels
-    char min_str[8], max_str[8];
+    char min_str[16], max_str[16];
     snprintf(min_str, sizeof(min_str), "%d.%d", min_x10 / 10, min_x10 % 10);
     snprintf(max_str, sizeof(max_str), "%d.%d", max_x10 / 10, max_x10 % 10);
     sh1106_set_cursor(&display, 4, 42);
@@ -902,7 +929,7 @@ static void draw_pid_menu(void) {
         
         // Show current value for Kp/Ki/Kd
         if (values[i] != NULL) {
-            char val[12];
+            char val[16];
             snprintf(val, sizeof(val), "%d.%d", *values[i] / 10, *values[i] % 10);
             sh1106_set_cursor(&display, 90, y + 2);
             sh1106_print(&display, val);
@@ -946,7 +973,7 @@ static void draw_pin_menu(void) {
         
         // Show GPIO number for pin items
         if (values[item_idx] >= 0) {
-            char val[8];
+            char val[16];
             snprintf(val, sizeof(val), "GPIO%d", values[item_idx]);
             sh1106_set_cursor(&display, 85, y + 2);
             sh1106_print(&display, val);
@@ -1256,6 +1283,14 @@ void app_main(void) {
     AiEsp32RotaryEncoder_setBoundaries(&rotaryEncoder, 0, 4, true);
     AiEsp32RotaryEncoder_setAcceleration(&rotaryEncoder, 0);
 
+    // Create stepper motor timer (precise pulse generation from high-priority task)
+    const esp_timer_create_args_t stepper_timer_args = {
+        .callback = stepper_timer_callback,
+        .name = "stepper"
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&stepper_timer_args, &stepper_timer_handle));
+    ESP_LOGI(TAG, "Stepper timer created");
+
     // Initialize display
     ret = sh1106_init(&display, I2C_MASTER_NUM, SCREEN_ADDRESS);
     if (ret != ESP_OK) {
@@ -1280,8 +1315,8 @@ void app_main(void) {
             }
         }
         
-        // Read MAX6675 temperature sensor (every 250ms - sensor needs ~220ms conversion time)
-        if (current_time - last_max6675_read > 250) {
+        // Read MAX6675 temperature sensor (every 300ms - sensor needs ~220ms conversion time)
+        if (current_time - last_max6675_read > 300) {
             float temp = read_max6675_temperature();
             if (temp >= 0) {  // Valid reading (negative means error)
                 current_temp = temp;
@@ -1299,7 +1334,7 @@ void app_main(void) {
                 pid_output = (float)open_loop_power;
             }
             update_heater_output(current_time);
-            update_stepper_motor();
+            // Stepper motor is now driven by hardware timer (stepper_timer_handle)
         }
 
         if (current_state == SPLASH) {
@@ -1393,6 +1428,7 @@ void app_main(void) {
                 }
                 case MOTOR_SPEED_SET:
                     motor_speed = new_encoder_value;
+                    if (is_running) stepper_timer_start();  // Update timer period live
                     break;
                 case MICROSTEP_SET: {
                     // Convert encoder value to microstep: 0=1, 1=2, 2=4, 3=8, 4=16, 5=32
