@@ -1,0 +1,7 @@
+﻿"boreDia"= 25
+"OutSideDia"= 47
+"width"= 16
+"ShoulderDia"= 32
+"Recess"= 42.2
+"D1@Sketch3"="OutSideDia"
+"D1@Sketch4"="Recess"
