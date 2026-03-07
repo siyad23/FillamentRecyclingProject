@@ -1,0 +1,62 @@
+# Build Artifacts
+build/
+dist/
+*.o
+*.a
+*.so
+*.dll
+*.exe
+
+# PlatformIO
+.pio/
+.platformio/
+.pioenvs/
+*.cpp.o
+*.c.o
+
+# ESP-IDF
+sdkconfig.old
+sdkconfig.defaults.old
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-workspace
+*.sublime-project
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# SolidWorks
+*.~sldprt
+*.~sldasm
+*.~stp
+*.SWJournal
+*.docx~
+
+# Temporary files
+*.tmp
+*.bak
+*.log
+
+# Node modules (if any web tooling is used)
+node_modules/
+
+# Environment
+.env
+.env.local
+
+# Qt Creator
+CMakeLists.txt.user
