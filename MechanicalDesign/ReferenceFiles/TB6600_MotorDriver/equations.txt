@@ -1,0 +1,4 @@
+﻿"mDriverWidth" = 56.8
+"mDriverLength" = 95.3
+"mDriverHeight" = 28.1
+"PCB width"= 35
