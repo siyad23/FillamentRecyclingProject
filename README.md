@@ -4,6 +4,18 @@ A complete open-source plastic bottle-to-3D-printer-filament recycling machine, 
 
 ---
 
+## Gallery
+
+![Render 1](Renders/Circle-platform-bokeh.bip.115.png)
+![Render 2](Renders/Circle-platform-bokeh.bip.116.png)
+![Render 3](Renders/Circle-platform-bokeh.bip.117.png)
+![Render 4](Renders/Circle-platform-bokeh.bip.118.png)
+![Render 5](Renders/Circle-platform-bokeh.bip.119.png)
+![Render 6](Renders/Circle-platform-bokeh.bip.120.png)
+![Render 7](Renders/Circle-platform-bokeh.bip.121.png)
+
+---
+
 ## Table of Contents
 
 - [Overview](#overview)
