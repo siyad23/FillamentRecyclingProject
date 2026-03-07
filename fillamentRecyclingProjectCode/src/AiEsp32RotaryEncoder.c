@@ -21,7 +21,8 @@ static const char *TAG = "RotaryEncoder";
 static const int8_t enc_states[] = {0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0};
 
 // Alternative half-step lookup table for more sensitive detection
-static const int8_t enc_states_half[] = {
+// Mark as unused to avoid compile warnings when not referenced
+static const int8_t enc_states_half[] __attribute__((unused)) = {
     0,  1, -1,  0,
    -1,  0,  0,  1,
     1,  0,  0, -1,
