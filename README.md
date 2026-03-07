@@ -256,4 +256,8 @@ pio device monitor
 
 ## License
 
-This project is open-source. The rotary encoder library is based on [ai-esp32-rotary-encoder](https://github.com/igorantolic/ai-esp32-rotary-encoder) by Igor Antolic (MIT License).
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+Copyright (c) 2026 Rahat Khan Siyad
+
+The rotary encoder library is based on [ai-esp32-rotary-encoder](https://github.com/igorantolic/ai-esp32-rotary-encoder) by Igor Antolic (MIT License).
